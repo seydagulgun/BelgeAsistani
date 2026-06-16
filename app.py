@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -9,13 +11,14 @@ from dotenv import load_dotenv, set_key
 
 ENV_FILE          = Path(__file__).parent / ".env"
 UPLOAD_DIR        = Path(__file__).parent / "uploads"
-CHAT_FILE         = Path(__file__).parent / "chat_history.json"
+SESSIONS_DIR      = Path(__file__).parent / "sessions"
 MAX_CHARS_PER_DOC = 60_000
 MAX_TOTAL_CHARS   = 180_000
 GEMINI_URL        = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 FREE_MODELS       = ["gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-1.5-pro"]
 
 UPLOAD_DIR.mkdir(exist_ok=True)
+SESSIONS_DIR.mkdir(exist_ok=True)
 load_dotenv(ENV_FILE)
 
 
@@ -35,12 +38,9 @@ def extract_text_from_bytes(data: bytes, filename: str) -> str:
 
 
 def _from_pdf(data):
-    import pdfplumber
-    text = ""
-    with pdfplumber.open(io.BytesIO(data)) as pdf:
-        for page in pdf.pages:
-            text += (page.extract_text() or "") + "\n"
-    return text
+    import fitz
+    doc = fitz.open(stream=data, filetype="pdf")
+    return "\n".join(page.get_text() for page in doc)
 
 
 def _from_docx(data):
@@ -95,16 +95,50 @@ def delete_file(filename: str):
         p.unlink(missing_ok=True)
 
 
-# ── Global sohbet geçmişi ────────────────────────────────────────────────────
+# ── Sohbet oturumları ────────────────────────────────────────────────────────
 
-def load_chat() -> list:
-    if CHAT_FILE.exists():
-        return json.loads(CHAT_FILE.read_text(encoding="utf-8"))
-    return []
+def list_sessions() -> list[dict]:
+    sessions = []
+    for f in SESSIONS_DIR.glob("*.json"):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            sessions.append({
+                "id": data["id"],
+                "title": data.get("title", "Yeni Sohbet"),
+                "created_at": data.get("created_at", ""),
+            })
+        except Exception:
+            pass
+    return sorted(sessions, key=lambda x: x["created_at"], reverse=True)
 
 
-def save_chat(messages: list):
-    CHAT_FILE.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
+def load_session(session_id: str) -> dict | None:
+    p = SESSIONS_DIR / f"{session_id}.json"
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return None
+
+
+def save_session(session: dict):
+    (SESSIONS_DIR / f"{session['id']}.json").write_text(
+        json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def delete_session(session_id: str):
+    (SESSIONS_DIR / f"{session_id}.json").unlink(missing_ok=True)
+
+
+def create_session() -> dict:
+    now = datetime.now()
+    session = {
+        "id": uuid.uuid4().hex[:10],
+        "title": now.strftime("%d %b, %H:%M"),
+        "created_at": now.isoformat(),
+        "messages": [],
+    }
+    save_session(session)
+    return session
 
 
 # ── Gemini REST ──────────────────────────────────────────────────────────────
@@ -120,7 +154,9 @@ def list_available_models(api_key: str) -> list[str]:
     return [n for n in names if "flash" in n or "pro" in n]
 
 
-def build_system_prompt(selected_docs: list[str]) -> str:
+def build_system_prompt(selected_docs: list[str]) -> str | None:
+    if not selected_docs:
+        return None
     parts = []
     total = 0
     for fname in selected_docs:
@@ -133,7 +169,6 @@ def build_system_prompt(selected_docs: list[str]) -> str:
         if total >= MAX_TOTAL_CHARS:
             parts.append("[...toplam karakter sınırına ulaşıldı, kalan belgeler dahil edilmedi]")
             break
-
     return (
         "Sen bir belge asistanısın. Sana verilen belgelerden YALNIZCA bu belgelerdeki bilgilere "
         "dayanarak sorulara cevap ver. Belgelerde olmayan bilgileri uydurma. "
@@ -149,10 +184,11 @@ def get_response(api_key: str, model: str, system_prompt: str, messages: list) -
         for m in messages
     ]
     payload = {
-        "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
         "generationConfig": {"maxOutputTokens": 2048},
     }
+    if system_prompt:
+        payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
     r = requests.post(
         GEMINI_URL.format(model=model),
         params={"key": api_key},
@@ -169,13 +205,14 @@ def get_response(api_key: str, model: str, system_prompt: str, messages: list) -
 # ── UI ───────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Belge Asistanı", page_icon="📚", layout="wide")
-st.title("📚 Belge Asistanı")
-st.caption("Belgelerini yükle, seçmek istediklerine tik at ve sorularını sor.")
 
-if "messages" not in st.session_state:
-    st.session_state["messages"] = load_chat()
-if "selected_docs" not in st.session_state:
-    st.session_state["selected_docs"] = set()
+# Session state init
+if "active_session_id" not in st.session_state:
+    existing = list_sessions()
+    if existing:
+        st.session_state["active_session_id"] = existing[0]["id"]
+    else:
+        st.session_state["active_session_id"] = create_session()["id"]
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 
@@ -206,7 +243,39 @@ with st.sidebar:
         st.session_state["model"] = st.selectbox("Model", models, index=default_idx)
 
     st.divider()
-    st.subheader("📁 Belge Yükle")
+
+    # ── Sohbet listesi ────────────────────────────────────────────────────────
+    st.subheader("💬 Sohbetler")
+
+    if st.button("➕ Yeni Sohbet", use_container_width=True, type="primary"):
+        new = create_session()
+        st.session_state["active_session_id"] = new["id"]
+        st.rerun()
+
+    sessions = list_sessions()
+    active_id = st.session_state["active_session_id"]
+
+    for s in sessions:
+        col1, col2 = st.columns([5, 1])
+        is_active = s["id"] == active_id
+        btn_type = "primary" if is_active else "secondary"
+        if col1.button(s["title"], key=f"sess_{s['id']}", use_container_width=True, type=btn_type):
+            st.session_state["active_session_id"] = s["id"]
+            st.rerun()
+        if col2.button("🗑", key=f"delsess_{s['id']}"):
+            delete_session(s["id"])
+            remaining = [x for x in sessions if x["id"] != s["id"]]
+            if remaining:
+                st.session_state["active_session_id"] = remaining[0]["id"]
+            else:
+                st.session_state["active_session_id"] = create_session()["id"]
+            st.rerun()
+
+    st.divider()
+
+    # ── Belge yönetimi ────────────────────────────────────────────────────────
+    st.subheader("📁 Belgeler")
+
     uploaded_files = st.file_uploader(
         "Belge ekle (çoklu seçim desteklenir)",
         type=["pdf", "docx", "csv", "xlsx", "xls", "txt"],
@@ -216,91 +285,83 @@ with st.sidebar:
         for f in uploaded_files:
             with st.spinner(f"{f.name} kaydediliyor..."):
                 name = save_file(f)
-                st.session_state["selected_docs"].add(name)
+                st.session_state[f"chk_{name}"] = True
         st.rerun()
 
-    st.divider()
     saved_files = load_saved_files()
-
     if saved_files:
-        st.subheader("📋 Belgeler")
-
         col_a, col_b = st.columns(2)
         if col_a.button("Tümünü Seç", use_container_width=True):
-            st.session_state["selected_docs"] = set(saved_files)
+            for f in saved_files:
+                st.session_state[f"chk_{f}"] = True
             st.rerun()
         if col_b.button("Seçimi Kaldır", use_container_width=True):
-            st.session_state["selected_docs"] = set()
+            for f in saved_files:
+                st.session_state[f"chk_{f}"] = False
             st.rerun()
 
         st.markdown("")
         for fname in saved_files:
             col1, col2 = st.columns([6, 1])
-            checked = fname in st.session_state["selected_docs"]
-            new_val = col1.checkbox(fname, value=checked, key=f"chk_{fname}")
-            if new_val != checked:
-                if new_val:
-                    st.session_state["selected_docs"].add(fname)
-                else:
-                    st.session_state["selected_docs"].discard(fname)
-                st.rerun()
+            col1.checkbox(fname, key=f"chk_{fname}")
             if col2.button("🗑", key=f"del_{fname}", help=f"{fname} sil"):
                 delete_file(fname)
-                st.session_state["selected_docs"].discard(fname)
+                st.session_state.pop(f"chk_{fname}", None)
                 st.rerun()
-
-    st.divider()
-    if st.button("🗑 Sohbeti Temizle", use_container_width=True):
-        st.session_state["messages"] = []
-        save_chat([])
-        st.rerun()
 
 
 # ── Ana Alan ─────────────────────────────────────────────────────────────────
 
-if not st.session_state.get("api_key"):
-    st.info("Sol panele Gemini API Key girin. [Ücretsiz al →](https://aistudio.google.com/app/apikey)")
-    st.stop()
+st.title("📚 Belge Asistanı")
+st.caption("Belgelerini yükle, seçmek istediklerine tik at ve sorularını sor.")
 
-selected = sorted(st.session_state["selected_docs"])
+selected = sorted(f for f in load_saved_files() if st.session_state.get(f"chk_{f}", False))
 
-if not selected:
-    if not load_saved_files():
-        st.info("Başlamak için sol panelden bir belge yükleyin.")
-    else:
-        st.info("Sol panelden taramak istediğiniz belgelere tik atın.")
-    st.stop()
+# Aktif oturumu yükle
+session = load_session(st.session_state["active_session_id"])
+if session is None:
+    session = create_session()
+    st.session_state["active_session_id"] = session["id"]
 
-# Aktif belgeler
-st.markdown(
-    "**Aktif Belgeler:** " + "  ".join(f"`{d}`" for d in selected),
-    help="Sorular yalnızca bu belgelerde aranacak."
-)
-st.divider()
+# Aktif belgeler göstergesi (yalnızca seçili belge varsa)
+if selected:
+    st.caption("**Aktif Belgeler:** " + "  ".join(f"`{d}`" for d in selected))
 
 # Sohbet geçmişi
-for msg in st.session_state["messages"]:
+for msg in session["messages"]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
 # Yeni soru
-if prompt := st.chat_input("Seçili belgeler hakkında soru sor..."):
-    st.session_state["messages"].append({"role": "user", "content": prompt})
+no_key = not st.session_state.get("api_key")
+if no_key:
+    placeholder = "Önce sol panele Gemini API Key girin..."
+else:
+    placeholder = "Bir şeyler sor..." if not selected else "Seçili belgeler hakkında soru sor..."
+
+if prompt := st.chat_input(placeholder, disabled=no_key):
+    session["messages"].append({"role": "user", "content": prompt})
+
+    # İlk mesajdan başlık üret
+    if len(session["messages"]) == 1:
+        session["title"] = prompt[:45] + ("…" if len(prompt) > 45 else "")
+
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner(f"{len(selected)} belge taranıyor..."):
+        spinner_text = f"{len(selected)} belge taranıyor..." if selected else "Yanıt oluşturuluyor..."
+        with st.spinner(spinner_text):
             try:
                 answer = get_response(
                     api_key=st.session_state["api_key"],
                     model=st.session_state.get("model", FREE_MODELS[0]),
                     system_prompt=build_system_prompt(selected),
-                    messages=st.session_state["messages"],
+                    messages=session["messages"],
                 )
             except RuntimeError as e:
                 answer = f"⚠️ {e}"
         st.markdown(answer)
 
-    st.session_state["messages"].append({"role": "assistant", "content": answer})
-    save_chat(st.session_state["messages"])
+    session["messages"].append({"role": "assistant", "content": answer})
+    save_session(session)

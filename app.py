@@ -219,19 +219,25 @@ if "active_session_id" not in st.session_state:
 with st.sidebar:
     st.header("⚙️ Ayarlar")
 
-    saved_key = os.getenv("GEMINI_API_KEY", "")
-    api_key = st.text_input(
-        "Gemini API Key", type="password",
-        value=st.session_state.get("api_key", saved_key),
-        help="aistudio.google.com/app/apikey adresinden ücretsiz alabilirsin",
-    )
-    if api_key and api_key != st.session_state.get("api_key"):
-        st.session_state["api_key"] = api_key
-        st.session_state.pop("available_models", None)
-        if api_key != saved_key:
-            set_key(str(ENV_FILE), "GEMINI_API_KEY", api_key)
-    elif api_key:
-        st.session_state["api_key"] = api_key
+    env_key = (
+        st.secrets.get("GEMINI_API_KEY")
+        if hasattr(st, "secrets") else None
+    ) or os.getenv("GEMINI_API_KEY", "")
+
+    if env_key:
+        st.session_state["api_key"] = env_key
+    else:
+        manual_key = st.text_input(
+            "Gemini API Key", type="password",
+            value=st.session_state.get("api_key", ""),
+            help="aistudio.google.com/app/apikey adresinden ücretsiz alabilirsin",
+        )
+        if manual_key and manual_key != st.session_state.get("api_key"):
+            st.session_state["api_key"] = manual_key
+            st.session_state.pop("available_models", None)
+            set_key(str(ENV_FILE), "GEMINI_API_KEY", manual_key)
+        elif manual_key:
+            st.session_state["api_key"] = manual_key
 
     if st.session_state.get("api_key"):
         if "available_models" not in st.session_state:

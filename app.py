@@ -196,10 +196,15 @@ def get_response(api_key: str, model: str, system_prompt: str, messages: list) -
         timeout=60,
     )
     if r.status_code != 200:
-        raise RuntimeError(
-            f"API Hatası {r.status_code}: {r.json().get('error', {}).get('message', r.text)}"
-        )
-    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        try:
+            msg = r.json().get("error", {}).get("message", r.text)
+        except Exception:
+            msg = r.text
+        raise RuntimeError(f"API Hatası {r.status_code}: {msg}")
+    try:
+        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Beklenmeyen API yanıtı: {r.text[:300]}")
 
 
 # ── UI ───────────────────────────────────────────────────────────────────────
@@ -361,12 +366,12 @@ if prompt := st.chat_input(placeholder, disabled=no_key):
             try:
                 answer = get_response(
                     api_key=st.session_state["api_key"],
-                    model=st.session_state.get("model", FREE_MODELS[0]),
+                    model=st.session_state.get("model") or FREE_MODELS[0],
                     system_prompt=build_system_prompt(selected),
                     messages=session["messages"],
                 )
-            except RuntimeError as e:
-                answer = f"⚠️ {e}"
+            except Exception as e:
+                answer = f"⚠️ Hata: {e}"
         st.markdown(answer)
 
     session["messages"].append({"role": "assistant", "content": answer})

@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -9,20 +10,76 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv, set_key
 
+# ── Sabitler ──────────────────────────────────────────────────────────────────
 ENV_FILE          = Path(__file__).parent / ".env"
-UPLOAD_DIR        = Path(__file__).parent / "uploads"
-SESSIONS_DIR      = Path(__file__).parent / "sessions"
+_BASE_UPLOAD      = Path(__file__).parent / "uploads"
+_BASE_SESSIONS    = Path(__file__).parent / "sessions"
 MAX_CHARS_PER_DOC = 60_000
 MAX_TOTAL_CHARS   = 180_000
 GEMINI_URL        = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GEMINI_STREAM_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent"
 FREE_MODELS       = ["gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-1.5-pro"]
 
-UPLOAD_DIR.mkdir(exist_ok=True)
-SESSIONS_DIR.mkdir(exist_ok=True)
+_BASE_UPLOAD.mkdir(exist_ok=True)
+_BASE_SESSIONS.mkdir(exist_ok=True)
 load_dotenv(ENV_FILE)
 
 
-# ── Dosya okuma ──────────────────────────────────────────────────────────────
+# ── Kullanıcı kimliği ─────────────────────────────────────────────────────────
+
+def _user_id() -> str:
+    """Streamlit Cloud viewer auth açıksa gerçek e-posta, değilse 'local'."""
+    try:
+        email = st.user.email
+        if email:
+            return re.sub(r"[^\w@.\-]", "_", email)
+    except AttributeError:
+        pass
+    try:
+        email = st.experimental_user.get("email")
+        if email:
+            return re.sub(r"[^\w@.\-]", "_", email)
+    except AttributeError:
+        pass
+    return "local"
+
+
+def _upload_dir() -> Path:
+    p = _BASE_UPLOAD / _user_id()
+    p.mkdir(exist_ok=True)
+    return p
+
+
+def _cache_dir() -> Path:
+    p = _upload_dir() / ".cache"
+    p.mkdir(exist_ok=True)
+    return p
+
+
+def _sessions_dir() -> Path:
+    p = _BASE_SESSIONS / _user_id()
+    p.mkdir(exist_ok=True)
+    return p
+
+# ── Supabase (isteğe bağlı) ───────────────────────────────────────────────────
+try:
+    from supabase import create_client
+    _SUPABASE_AVAILABLE = True
+except ImportError:
+    _SUPABASE_AVAILABLE = False
+
+
+def _sb():
+    if not _SUPABASE_AVAILABLE:
+        return None
+    url = (st.secrets.get("SUPABASE_URL") if hasattr(st, "secrets") else None) or os.getenv("SUPABASE_URL", "")
+    key = (st.secrets.get("SUPABASE_KEY") if hasattr(st, "secrets") else None) or os.getenv("SUPABASE_KEY", "")
+    if not url or not key:
+        return None
+    return create_client(url, key)
+
+
+# ── Dosya okuma ───────────────────────────────────────────────────────────────
 
 def extract_text_from_bytes(data: bytes, filename: str) -> str:
     name = filename.lower()
@@ -56,77 +113,171 @@ def _from_csv(data):
 def _from_excel(data):
     import pandas as pd
     sheets = pd.read_excel(io.BytesIO(data), sheet_name=None)
-    return "\n\n".join(
-        f"--- {n} ---\n{df.to_string(index=False)}" for n, df in sheets.items()
-    )
+    return "\n\n".join(f"--- {n} ---\n{df.to_string(index=False)}" for n, df in sheets.items())
 
 
-# ── Dosya yönetimi ───────────────────────────────────────────────────────────
+# ── Dosya yönetimi ────────────────────────────────────────────────────────────
 
 def save_file(uploaded_file) -> str:
-    raw_path  = UPLOAD_DIR / uploaded_file.name
-    text_path = UPLOAD_DIR / (uploaded_file.name + ".txt")
+    uid = _user_id()
+    raw_path = _upload_dir() / uploaded_file.name
     data = uploaded_file.read()
     raw_path.write_bytes(data)
     text = extract_text_from_bytes(data, uploaded_file.name)
-    text_path.write_text(text, encoding="utf-8")
+    (_cache_dir() / (uploaded_file.name + ".txt")).write_text(text, encoding="utf-8")
+    sb = _sb()
+    if sb:
+        try:
+            sb.table("documents").upsert({"name": uploaded_file.name, "text_content": text, "user_id": uid}).execute()
+        except Exception:
+            pass
     return uploaded_file.name
 
 
 def load_saved_files() -> list[str]:
-    return sorted(
-        p.name for p in UPLOAD_DIR.iterdir()
-        if not p.name.endswith(".txt")
-    )
+    uid = _user_id()
+    sb = _sb()
+    if sb:
+        try:
+            res = sb.table("documents").select("name").eq("user_id", uid).execute()
+            return sorted(r["name"] for r in res.data)
+        except Exception:
+            pass
+    return sorted(p.name for p in _upload_dir().iterdir() if p.is_file())
 
 
 def load_file_text(filename: str) -> str:
-    text_path = UPLOAD_DIR / (filename + ".txt")
-    if text_path.exists():
-        return text_path.read_text(encoding="utf-8")
-    raw_path = UPLOAD_DIR / filename
-    text = extract_text_from_bytes(raw_path.read_bytes(), filename)
-    text_path.write_text(text, encoding="utf-8")
+    uid = _user_id()
+    sb = _sb()
+    if sb:
+        try:
+            res = sb.table("documents").select("text_content").eq("name", filename).eq("user_id", uid).single().execute()
+            return res.data["text_content"]
+        except Exception:
+            pass
+    cache = _cache_dir() / (filename + ".txt")
+    if cache.exists():
+        return cache.read_text(encoding="utf-8")
+    raw = _upload_dir() / filename
+    text = extract_text_from_bytes(raw.read_bytes(), filename)
+    cache.write_text(text, encoding="utf-8")
     return text
 
 
 def delete_file(filename: str):
-    for p in [UPLOAD_DIR / filename, UPLOAD_DIR / (filename + ".txt")]:
+    uid = _user_id()
+    sb = _sb()
+    if sb:
+        try:
+            sb.table("documents").delete().eq("name", filename).eq("user_id", uid).execute()
+        except Exception:
+            pass
+    for p in [
+        _upload_dir() / filename,
+        _cache_dir() / (filename + ".txt"),
+        _cache_dir() / (filename + ".summary.txt"),
+        _cache_dir() / (filename + ".questions.json"),
+    ]:
         p.unlink(missing_ok=True)
 
 
-# ── Sohbet oturumları ────────────────────────────────────────────────────────
+def load_summary(filename: str) -> str:
+    uid = _user_id()
+    sb = _sb()
+    if sb:
+        try:
+            res = sb.table("documents").select("summary").eq("name", filename).eq("user_id", uid).single().execute()
+            return res.data.get("summary") or ""
+        except Exception:
+            pass
+    p = _cache_dir() / (filename + ".summary.txt")
+    return p.read_text(encoding="utf-8") if p.exists() else ""
+
+
+def load_questions(filename: str) -> list[str]:
+    uid = _user_id()
+    sb = _sb()
+    if sb:
+        try:
+            res = sb.table("documents").select("questions").eq("name", filename).eq("user_id", uid).single().execute()
+            return res.data.get("questions") or []
+        except Exception:
+            pass
+    p = _cache_dir() / (filename + ".questions.json")
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+
+
+def save_insights(filename: str, summary: str, questions: list[str]):
+    uid = _user_id()
+    sb = _sb()
+    if sb:
+        try:
+            sb.table("documents").update({"summary": summary, "questions": questions}).eq("name", filename).eq("user_id", uid).execute()
+        except Exception:
+            pass
+    (_cache_dir() / (filename + ".summary.txt")).write_text(summary, encoding="utf-8")
+    (_cache_dir() / (filename + ".questions.json")).write_text(
+        json.dumps(questions, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+# ── Sohbet oturumları ─────────────────────────────────────────────────────────
 
 def list_sessions() -> list[dict]:
-    sessions = []
-    for f in SESSIONS_DIR.glob("*.json"):
+    uid = _user_id()
+    sb = _sb()
+    if sb:
         try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-            sessions.append({
-                "id": data["id"],
-                "title": data.get("title", "Yeni Sohbet"),
-                "created_at": data.get("created_at", ""),
-            })
+            res = sb.table("sessions").select("id, title, created_at").eq("user_id", uid).order("created_at", desc=True).execute()
+            return res.data
+        except Exception:
+            pass
+    sessions = []
+    for f in _sessions_dir().glob("*.json"):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            sessions.append({"id": d["id"], "title": d.get("title", ""), "created_at": d.get("created_at", "")})
         except Exception:
             pass
     return sorted(sessions, key=lambda x: x["created_at"], reverse=True)
 
 
 def load_session(session_id: str) -> dict | None:
-    p = SESSIONS_DIR / f"{session_id}.json"
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    return None
+    uid = _user_id()
+    sb = _sb()
+    if sb:
+        try:
+            res = sb.table("sessions").select("*").eq("id", session_id).eq("user_id", uid).single().execute()
+            return res.data
+        except Exception:
+            pass
+    p = _sessions_dir() / f"{session_id}.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
 
 
 def save_session(session: dict):
-    (SESSIONS_DIR / f"{session['id']}.json").write_text(
+    uid = _user_id()
+    sb = _sb()
+    if sb:
+        try:
+            sb.table("sessions").upsert({**session, "user_id": uid}).execute()
+            return
+        except Exception:
+            pass
+    (_sessions_dir() / f"{session['id']}.json").write_text(
         json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
 
 def delete_session(session_id: str):
-    (SESSIONS_DIR / f"{session_id}.json").unlink(missing_ok=True)
+    uid = _user_id()
+    sb = _sb()
+    if sb:
+        try:
+            sb.table("sessions").delete().eq("id", session_id).eq("user_id", uid).execute()
+        except Exception:
+            pass
+    (_sessions_dir() / f"{session_id}.json").unlink(missing_ok=True)
 
 
 def create_session() -> dict:
@@ -141,17 +292,20 @@ def create_session() -> dict:
     return session
 
 
-# ── Gemini REST ──────────────────────────────────────────────────────────────
+# ── Gemini ────────────────────────────────────────────────────────────────────
 
 def list_available_models(api_key: str) -> list[str]:
-    r = requests.get(
-        "https://generativelanguage.googleapis.com/v1beta/models",
-        params={"key": api_key}, timeout=10,
-    )
-    if r.status_code != 200:
+    try:
+        r = requests.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            params={"key": api_key}, timeout=10,
+        )
+        if r.status_code != 200:
+            return []
+        names = [m["name"].replace("models/", "") for m in r.json().get("models", [])]
+        return [n for n in names if "flash" in n or "pro" in n]
+    except Exception:
         return []
-    names = [m["name"].replace("models/", "") for m in r.json().get("models", [])]
-    return [n for n in names if "flash" in n or "pro" in n]
 
 
 def build_system_prompt(selected_docs: list[str]) -> str | None:
@@ -177,23 +331,46 @@ def build_system_prompt(selected_docs: list[str]) -> str | None:
     )
 
 
-def get_response(api_key: str, model: str, system_prompt: str, messages: list) -> str:
+def generate_insights(text: str, api_key: str, model: str) -> tuple[str, list[str]]:
+    prompt = (
+        "Aşağıdaki belgeyi analiz et. YALNIZCA şu JSON formatında yanıt ver, başka hiçbir şey yazma:\n"
+        '{"summary": "2-3 cümlelik Türkçe özet", "questions": ["soru1", "soru2", "soru3", "soru4"]}\n\n'
+        f"Belge:\n{text[:8000]}"
+    )
+    try:
+        r = requests.post(
+            GEMINI_URL.format(model=model),
+            params={"key": api_key},
+            json={"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                  "generationConfig": {"maxOutputTokens": 512}},
+            timeout=30,
+        )
+        raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            data = json.loads(match.group())
+            return data.get("summary", ""), data.get("questions", [])[:4]
+    except Exception:
+        pass
+    return "", []
+
+
+def stream_response(api_key: str, model: str, system_prompt: str | None, messages: list):
     contents = [
         {"role": "user" if m["role"] == "user" else "model",
          "parts": [{"text": m["content"]}]}
         for m in messages
     ]
-    payload = {
-        "contents": contents,
-        "generationConfig": {"maxOutputTokens": 2048},
-    }
+    payload = {"contents": contents, "generationConfig": {"maxOutputTokens": 2048}}
     if system_prompt:
         payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
+
     r = requests.post(
-        GEMINI_URL.format(model=model),
-        params={"key": api_key},
+        GEMINI_STREAM_URL.format(model=model),
+        params={"key": api_key, "alt": "sse"},
         json=payload,
-        timeout=60,
+        stream=True,
+        timeout=120,
     )
     if r.status_code != 200:
         try:
@@ -201,34 +378,34 @@ def get_response(api_key: str, model: str, system_prompt: str, messages: list) -
         except Exception:
             msg = r.text
         raise RuntimeError(f"API Hatası {r.status_code}: {msg}")
-    try:
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
-        raise RuntimeError(f"Beklenmeyen API yanıtı: {r.text[:300]}")
+
+    for line in r.iter_lines():
+        if not line or not line.startswith(b"data: "):
+            continue
+        raw = line[6:]
+        if raw == b"[DONE]":
+            break
+        try:
+            data = json.loads(raw)
+            yield data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, json.JSONDecodeError):
+            pass
 
 
-# ── UI ───────────────────────────────────────────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Belge Asistanı", page_icon="📚", layout="wide")
 
-# Session state init
 if "active_session_id" not in st.session_state:
     existing = list_sessions()
-    if existing:
-        st.session_state["active_session_id"] = existing[0]["id"]
-    else:
-        st.session_state["active_session_id"] = create_session()["id"]
+    st.session_state["active_session_id"] = existing[0]["id"] if existing else create_session()["id"]
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.header("⚙️ Ayarlar")
 
-    env_key = (
-        st.secrets.get("GEMINI_API_KEY")
-        if hasattr(st, "secrets") else None
-    ) or os.getenv("GEMINI_API_KEY", "")
-
+    env_key = (st.secrets.get("GEMINI_API_KEY") if hasattr(st, "secrets") else None) or os.getenv("GEMINI_API_KEY", "")
     if env_key:
         st.session_state["api_key"] = env_key
     else:
@@ -259,8 +436,7 @@ with st.sidebar:
     st.subheader("💬 Sohbetler")
 
     if st.button("➕ Yeni Sohbet", use_container_width=True, type="primary"):
-        new = create_session()
-        st.session_state["active_session_id"] = new["id"]
+        st.session_state["active_session_id"] = create_session()["id"]
         st.rerun()
 
     sessions = list_sessions()
@@ -269,26 +445,39 @@ with st.sidebar:
     for s in sessions:
         col1, col2 = st.columns([5, 1])
         is_active = s["id"] == active_id
-        btn_type = "primary" if is_active else "secondary"
-        if col1.button(s["title"], key=f"sess_{s['id']}", use_container_width=True, type=btn_type):
+        if col1.button(s["title"], key=f"sess_{s['id']}", use_container_width=True,
+                       type="primary" if is_active else "secondary"):
             st.session_state["active_session_id"] = s["id"]
             st.rerun()
         if col2.button("🗑", key=f"delsess_{s['id']}"):
             delete_session(s["id"])
             remaining = [x for x in sessions if x["id"] != s["id"]]
-            if remaining:
-                st.session_state["active_session_id"] = remaining[0]["id"]
-            else:
-                st.session_state["active_session_id"] = create_session()["id"]
+            st.session_state["active_session_id"] = remaining[0]["id"] if remaining else create_session()["id"]
             st.rerun()
+
+    # Sohbet yeniden adlandırma (aktif sohbet için)
+    active_meta = next((s for s in sessions if s["id"] == active_id), None)
+    if active_meta:
+        new_title = st.text_input(
+            "Sohbet adı",
+            value=active_meta["title"],
+            key=f"title_{active_id}",
+            placeholder="Sohbet adını düzenle...",
+        )
+        if new_title and new_title != active_meta["title"]:
+            sess = load_session(active_id)
+            if sess:
+                sess["title"] = new_title
+                save_session(sess)
+                st.rerun()
 
     st.divider()
 
-    # ── Belge yönetimi ────────────────────────────────────────────────────────
+    # ── Belgeler ──────────────────────────────────────────────────────────────
     st.subheader("📁 Belgeler")
 
     uploaded_files = st.file_uploader(
-        "Belge ekle (çoklu seçim desteklenir)",
+        "Belge ekle",
         type=["pdf", "docx", "csv", "xlsx", "xls", "txt"],
         accept_multiple_files=True,
     )
@@ -297,6 +486,16 @@ with st.sidebar:
             with st.spinner(f"{f.name} kaydediliyor..."):
                 name = save_file(f)
                 st.session_state[f"chk_{name}"] = True
+            if st.session_state.get("api_key") and not load_summary(name):
+                with st.spinner(f"{name} analiz ediliyor..."):
+                    text = load_file_text(name)
+                    summary, questions = generate_insights(
+                        text,
+                        st.session_state["api_key"],
+                        st.session_state.get("model") or FREE_MODELS[0],
+                    )
+                    if summary or questions:
+                        save_insights(name, summary, questions)
         st.rerun()
 
     saved_files = load_saved_files()
@@ -321,58 +520,92 @@ with st.sidebar:
                 st.rerun()
 
 
-# ── Ana Alan ─────────────────────────────────────────────────────────────────
+# ── Ana Alan ──────────────────────────────────────────────────────────────────
 
 st.title("📚 Belge Asistanı")
 st.caption("Belgelerini yükle, seçmek istediklerine tik at ve sorularını sor.")
 
 selected = sorted(f for f in load_saved_files() if st.session_state.get(f"chk_{f}", False))
 
-# Aktif oturumu yükle
 session = load_session(st.session_state["active_session_id"])
 if session is None:
     session = create_session()
     st.session_state["active_session_id"] = session["id"]
 
-# Aktif belgeler göstergesi (yalnızca seçili belge varsa)
 if selected:
     st.caption("**Aktif Belgeler:** " + "  ".join(f"`{d}`" for d in selected))
+
+# Sohbeti dışa aktar
+if session["messages"]:
+    lines = [
+        f"{'**Siz**' if m['role'] == 'user' else '**Asistan**'}\n\n{m['content']}"
+        for m in session["messages"]
+    ]
+    st.download_button(
+        "⬇️ Sohbeti İndir (.md)",
+        "\n\n---\n\n".join(lines),
+        file_name=f"{session['title']}.md",
+        mime="text/markdown",
+    )
+
+st.divider()
+
+# Özet ve soru önerileri (boş sohbet + seçili belgeler)
+if not session["messages"] and selected:
+    for fname in selected:
+        summary  = load_summary(fname)
+        questions = load_questions(fname)
+        if summary:
+            with st.expander(f"📄 {fname} — Özet", expanded=True):
+                st.markdown(summary)
+        if questions:
+            st.markdown(f"**{fname} için önerilen sorular:**")
+            cols = st.columns(2)
+            for i, q in enumerate(questions):
+                if cols[i % 2].button(q, key=f"sug_{fname}_{i}", use_container_width=True):
+                    st.session_state["pending_prompt"] = q
+                    st.rerun()
+        if summary or questions:
+            st.divider()
 
 # Sohbet geçmişi
 for msg in session["messages"]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Yeni soru
+# Giriş
 no_key = not st.session_state.get("api_key")
-if no_key:
-    placeholder = "Önce sol panele Gemini API Key girin..."
-else:
-    placeholder = "Bir şeyler sor..." if not selected else "Seçili belgeler hakkında soru sor..."
+placeholder = (
+    "Önce sol panele Gemini API Key girin..." if no_key
+    else ("Seçili belgeler hakkında soru sor..." if selected else "Bir şeyler sor...")
+)
 
-if prompt := st.chat_input(placeholder, disabled=no_key):
+pending    = st.session_state.pop("pending_prompt", None)
+chat_input = st.chat_input(placeholder, disabled=no_key)
+prompt     = pending or chat_input
+
+if prompt:
     session["messages"].append({"role": "user", "content": prompt})
-
-    # İlk mesajdan başlık üret
     if len(session["messages"]) == 1:
         session["title"] = prompt[:45] + ("…" if len(prompt) > 45 else "")
+        save_session(session)
 
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        spinner_text = f"{len(selected)} belge taranıyor..." if selected else "Yanıt oluşturuluyor..."
-        with st.spinner(spinner_text):
-            try:
-                answer = get_response(
+        try:
+            answer = st.write_stream(
+                stream_response(
                     api_key=st.session_state["api_key"],
                     model=st.session_state.get("model") or FREE_MODELS[0],
                     system_prompt=build_system_prompt(selected),
                     messages=session["messages"],
                 )
-            except Exception as e:
-                answer = f"⚠️ Hata: {e}"
-        st.markdown(answer)
+            )
+        except Exception as e:
+            answer = f"⚠️ Hata: {e}"
+            st.markdown(answer)
 
     session["messages"].append({"role": "assistant", "content": answer})
     save_session(session)

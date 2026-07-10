@@ -397,14 +397,11 @@ def _auth_configured() -> bool:
         return False
 
 if _auth_configured():
-    try:
-        if not st.user.is_logged_in:
-            st.title("📚 Belge Asistanı")
-            st.write("Devam etmek için giriş yapın.")
-            st.login()
-            st.stop()
-    except Exception:
-        pass
+    if not st.user.is_logged_in:
+        st.title("📚 Belge Asistanı")
+        st.write("Devam etmek için giriş yapın.")
+        st.login()
+        st.stop()
 
 if "active_session_id" not in st.session_state:
     existing = list_sessions()
@@ -413,14 +410,10 @@ if "active_session_id" not in st.session_state:
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    if _auth_configured():
-        try:
-            if st.user.is_logged_in:
-                st.caption(f"👤 {st.user.email}")
-                if st.button("Çıkış Yap", use_container_width=True):
-                    st.logout()
-        except Exception:
-            pass
+    if _auth_configured() and st.user.is_logged_in:
+        st.caption(f"👤 {st.user.email}")
+        if st.button("Çıkış Yap", use_container_width=True):
+            st.logout()
 
     st.header("⚙️ Ayarlar")
 

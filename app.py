@@ -28,17 +28,10 @@ load_dotenv(ENV_FILE)
 # ── Kullanıcı kimliği ─────────────────────────────────────────────────────────
 
 def _user_id() -> str:
-    """Streamlit Cloud viewer auth açıksa gerçek e-posta, değilse 'local'."""
+    """Giriş yapılmışsa kullanıcı e-postası, değilse 'local'."""
     try:
-        email = st.user.email
-        if email:
-            return re.sub(r"[^\w@.\-]", "_", email)
-    except AttributeError:
-        pass
-    try:
-        email = st.experimental_user.get("email")
-        if email:
-            return re.sub(r"[^\w@.\-]", "_", email)
+        if st.user.is_logged_in and st.user.email:
+            return re.sub(r"[^\w@.\-]", "_", st.user.email)
     except AttributeError:
         pass
     return "local"
@@ -396,6 +389,16 @@ def stream_response(api_key: str, model: str, system_prompt: str | None, message
 
 st.set_page_config(page_title="Belge Asistanı", page_icon="📚", layout="wide")
 
+# ── Giriş zorunluluğu ─────────────────────────────────────────────────────────
+try:
+    if not st.user.is_logged_in:
+        st.title("📚 Belge Asistanı")
+        st.write("Devam etmek için giriş yapın.")
+        st.login()
+        st.stop()
+except AttributeError:
+    pass  # st.login() yoksa (eski Streamlit veya auth config eksikse) atla
+
 if "active_session_id" not in st.session_state:
     existing = list_sessions()
     st.session_state["active_session_id"] = existing[0]["id"] if existing else create_session()["id"]
@@ -403,6 +406,14 @@ if "active_session_id" not in st.session_state:
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
+    try:
+        if st.user.is_logged_in:
+            st.caption(f"👤 {st.user.email}")
+            if st.button("Çıkış Yap", use_container_width=True):
+                st.logout()
+    except AttributeError:
+        pass
+
     st.header("⚙️ Ayarlar")
 
     env_key = (st.secrets.get("GEMINI_API_KEY") if hasattr(st, "secrets") else None) or os.getenv("GEMINI_API_KEY", "")

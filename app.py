@@ -498,21 +498,24 @@ with st.sidebar:
         accept_multiple_files=True,
     )
     if uploaded_files:
-        for f in uploaded_files:
-            with st.spinner(f"{f.name} kaydediliyor..."):
-                name = save_file(f)
-                st.session_state[f"chk_{name}"] = True
-            if st.session_state.get("api_key") and not load_summary(name):
-                with st.spinner(f"{name} analiz ediliyor..."):
-                    text = load_file_text(name)
-                    summary, questions = generate_insights(
-                        text,
-                        st.session_state["api_key"],
-                        st.session_state.get("model") or FREE_MODELS[0],
-                    )
-                    if summary or questions:
-                        save_insights(name, summary, questions)
-        st.rerun()
+        upload_key = tuple(sorted(f.name for f in uploaded_files))
+        if st.session_state.get("_last_upload") != upload_key:
+            st.session_state["_last_upload"] = upload_key
+            for f in uploaded_files:
+                with st.spinner(f"{f.name} kaydediliyor..."):
+                    name = save_file(f)
+                    st.session_state[f"chk_{name}"] = True
+                if st.session_state.get("api_key") and not load_summary(name):
+                    with st.spinner(f"{name} analiz ediliyor..."):
+                        text = load_file_text(name)
+                        summary, questions = generate_insights(
+                            text,
+                            st.session_state["api_key"],
+                            st.session_state.get("model") or FREE_MODELS[0],
+                        )
+                        if summary or questions:
+                            save_insights(name, summary, questions)
+            st.rerun()
 
     saved_files = load_saved_files()
     if saved_files:

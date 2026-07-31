@@ -589,6 +589,8 @@ if not session["messages"] and selected:
 
 # Sohbet geçmişi
 for msg in session["messages"]:
+    if not msg.get("content"):
+        continue
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
@@ -612,6 +614,7 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    answer = ""
     with st.chat_message("assistant"):
         try:
             answer = st.write_stream(
@@ -621,10 +624,11 @@ if prompt:
                     system_prompt=build_system_prompt(selected),
                     messages=session["messages"],
                 )
-            )
+            ) or ""
         except Exception as e:
             answer = f"⚠️ Hata: {e}"
             st.markdown(answer)
 
-    session["messages"].append({"role": "assistant", "content": answer})
-    save_session(session)
+    if answer:
+        session["messages"].append({"role": "assistant", "content": answer})
+        save_session(session)

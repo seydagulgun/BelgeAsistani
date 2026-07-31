@@ -396,6 +396,7 @@ def _auth_configured() -> bool:
     except Exception:
         return False
 
+
 if _auth_configured():
     if not st.user.is_logged_in:
         st.title("📚 Belge Asistanı")
@@ -417,7 +418,10 @@ with st.sidebar:
 
     st.header("⚙️ Ayarlar")
 
-    env_key = (st.secrets.get("GEMINI_API_KEY") if hasattr(st, "secrets") else None) or os.getenv("GEMINI_API_KEY", "")
+    try:
+        env_key = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY", "")
+    except Exception:
+        env_key = os.getenv("GEMINI_API_KEY", "")
     if env_key:
         st.session_state["api_key"] = env_key
     else:
